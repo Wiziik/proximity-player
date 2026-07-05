@@ -178,8 +178,7 @@ ROWS = [
     ("Trigger",  "proximity_ratio", 0.01, 2),
     ("Debounce", "consec_frames",   1,    0),
     ("Cooldown", "cooldown_s",      1,    0),
-    ("Presence", "presence_ratio",  0.01, 2),
-    ("Idle ret", "idle_return_s",   1,    0),
+    ("Live",     "live_s",          1,    0),
 ]
 ROW_Y0, ROW_H = 96, 38
 BTN_W = 64

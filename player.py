@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Proximity-triggered two-video player.
+"""Proximity-triggered video player with live-mirror trigger.
 
 Loops videos/idle.mp4 fullscreen in mpv. A webcam is watched with OpenCV
 background subtraction; when something large (= close) enters the frame,
-videos/trigger.mp4 plays once, then the idle loop resumes.
+the screen switches to the LIVE webcam feed for live_s seconds (a mirror),
+then the idle loop resumes. The camera is handed over to mpv during the
+live view (v4l2 = one opener), so no detection happens while it shows.
 
 Tune the CONFIG block below, or override with env vars of the same name.
 Live-tunable settings are exposed on a touch-friendly web panel at
@@ -39,9 +41,9 @@ SETTINGS_FILE = os.path.join(BASE, "settings.json")
 # Live-tunable settings: (env default, min, max, step, label).
 # proximity_ratio: fraction of the frame that must be "foreground" to count
 # as proximity. Bigger = person must be closer. 0.05 sensitive, 0.30 close.
-# presence_ratio / idle_return_s: while the trigger video plays, someone
-# still counts as "present" above the (lower) presence ratio; if nobody is
-# seen for idle_return_s, cut back to idle instead of finishing the video.
+# live_s: how long the live webcam "mirror" view stays on screen. There is
+# no presence detection during it — mpv owns the camera (one opener only),
+# so the duration is fixed.
 SETTING_DEFS = {
     "proximity_ratio": (float(os.environ.get("PROXIMITY_RATIO", 0.15)),
                         0.01, 0.50, 0.01, "Trigger threshold"),
@@ -49,10 +51,8 @@ SETTING_DEFS = {
                         1, 10, 1, "Debounce frames"),
     "cooldown_s":      (float(os.environ.get("COOLDOWN_S", 5.0)),
                         0, 60, 1, "Cooldown (s)"),
-    "presence_ratio":  (float(os.environ.get("PRESENCE_RATIO", 0.05)),
-                        0.01, 0.30, 0.01, "Presence threshold"),
-    "idle_return_s":   (float(os.environ.get("IDLE_RETURN_S", 5.0)),
-                        1, 60, 1, "Idle return (s)"),
+    "live_s":          (float(os.environ.get("LIVE_S", 15.0)),
+                        3, 120, 1, "Live view (s)"),
 }
 SETTINGS = {k: v[0] for k, v in SETTING_DEFS.items()}
 SETTINGS_LOCK = threading.Lock()
@@ -195,14 +195,24 @@ class Mpv:
         else:
             log("no idle video found!")
 
-    def play_trigger(self):
-        v = find_video("trigger")
-        if not v:
-            log("no trigger video found, staying on idle")
-            return False
+    def play_live(self):
+        """Fullscreen live view of the webcam. Caller must have released
+        the OpenCV capture first — v4l2 allows a single opener."""
         self.cmd("set_property", "loop-file", "no")
-        self.cmd("loadfile", v, "replace")
-        return True
+        self.cmd("loadfile", f"av://v4l2:/dev/video{CAM_INDEX}", "replace")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
 
 
 UI_HTML = """<!DOCTYPE html>
@@ -391,11 +401,10 @@ def main():
     load_settings()
     start_ui()
     sync_usb_cache()
-    for name in ("idle", "trigger"):
-        v = find_video(name)
-        if not v:
-            sys.exit(f"no '{name}' video on USB or in videos/")
-        log(f"{name}: {v}")
+    v = find_video("idle")
+    if not v:
+        sys.exit("no 'idle' video on USB or in videos/")
+    log(f"idle: {v}")
 
     mpv = Mpv()
     mpv.play_idle()
@@ -409,43 +418,79 @@ def main():
 
     start = time.time()
     hot_frames = 0
-    state = "idle"            # idle | playing | cooldown
+    state = "idle"            # idle | live | cooldown
     cooldown_until = 0.0
+    live_until = 0.0
     frame_interval = 1.0 / DETECT_FPS
     total_px = CAM_W * CAM_H
+
+    def start_live():
+        """Hand the camera over to mpv for the live mirror view."""
+        nonlocal cap, state, live_until
+        if cap is not None:
+            cap.release()
+            cap = None
+        mpv.play_live()
+        state = "live"
+        live_until = time.time() + setting("live_s")
+
+    def end_live(why):
+        nonlocal mpv, state, cooldown_until, next_cam_try, start
+        # mpv SEGFAULTS tearing down the v4l2 demuxer ("Some buffers are
+        # still owned by the caller on close"), so never swap away from the
+        # live stream — replace the whole mpv process instead.
+        mpv.close()
+        mpv = Mpv()
+        mpv.play_idle()
+        state = "cooldown"
+        cooldown_until = time.time() + setting("cooldown_s")
+        # give mpv a moment to close the device before OpenCV reopens it
+        next_cam_try = time.time() + 2.0
+        start = time.time()   # re-warm the bg model on reopen
+        log(f"live view {why} -> idle + cooldown")
 
     while True:
         t0 = time.time()
 
         if mpv.proc.poll() is not None:
-            sys.exit("mpv exited")
+            if state == "live":
+                end_live("mpv died")     # closes + respawns
+            else:
+                log("mpv died, respawning")
+                mpv.close()
+                mpv = Mpv()
+                mpv.play_idle()
 
-        # mpv events: trigger video finished -> back to idle
+        # mpv events: live stream died (camera yanked/busy) -> back to idle
         for ev in mpv.events():
             if ev.get("event") == "end-file":
                 reason = ev.get("reason", "")
                 if reason not in ("eof", "error"):
                     continue
-                if state == "playing":
-                    mpv.play_idle()
-                    state = "cooldown"
-                    cd = setting("cooldown_s")
-                    cooldown_until = time.time() + cd
-                    log(f"trigger done ({reason}), idle + {cd:.0f}s cooldown")
+                if state == "live":
+                    end_live(f"ended ({reason})")
                 else:
                     # anything else ended (hiccup/external): never leave black
                     mpv.play_idle()
                     log(f"unexpected end-file ({reason}), reloading idle")
 
-        # Web-panel "test trigger" button: fire as if proximity was seen.
+        # Web/touch-panel "test trigger" button: fire the live view now.
         if TEST_TRIGGER.is_set():
             TEST_TRIGGER.clear()
-            if state != "playing":
-                log("test trigger from web UI")
-                if mpv.play_trigger():
-                    state = "playing"
-                    last_seen = time.time()
+            if state != "live" and (cap is not None
+                                    or os.path.exists(f"/dev/video{CAM_INDEX}")):
+                log("test trigger -> live view")
+                start_live()
                 hot_frames = 0
+
+        # Live mirror on screen: mpv owns the camera, just wait out the timer.
+        if state == "live":
+            STATUS.update(state=state, camera=True, ratio=0.0)
+            if time.time() >= live_until:
+                end_live("done")
+            else:
+                time.sleep(0.2)
+            continue
 
         STATUS["state"] = state
         STATUS["camera"] = cap is not None
@@ -472,11 +517,7 @@ def main():
             cap = None
             continue
 
-        # Freeze the background model while the trigger video plays, so a
-        # person standing still doesn't get absorbed into the background
-        # and keeps counting as present.
-        lr = 0 if state == "playing" else -1
-        mask = bg.apply(frame, learningRate=lr)
+        mask = bg.apply(frame)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         ratio = cv2.countNonZero(mask) / total_px
         STATUS["ratio"] = round(ratio, 4)
@@ -492,20 +533,9 @@ def main():
             else:
                 hot_frames = 0
             if hot_frames >= setting("consec_frames"):
-                log(f"PROXIMITY (ratio={ratio:.2f}) -> trigger video")
-                if mpv.play_trigger():
-                    state = "playing"
-                    last_seen = time.time()
+                log(f"PROXIMITY (ratio={ratio:.2f}) -> live view")
+                start_live()
                 hot_frames = 0
-
-        elif state == "playing":
-            if ratio >= setting("presence_ratio"):
-                last_seen = time.time()
-            elif time.time() - last_seen > setting("idle_return_s"):
-                log("nobody in view -> back to idle")
-                mpv.play_idle()
-                state = "cooldown"
-                cooldown_until = time.time() + setting("cooldown_s")
 
         dt = time.time() - t0
         if dt < frame_interval:

@@ -1,8 +1,9 @@
 # Proximity-triggered video player
 
 Raspberry Pi 4 kiosk for an installation: loops an **idle** video on a PAL
-composite TV; when the webcam sees someone approach, plays a **trigger**
-video once, then returns to the idle loop.
+composite TV; when the webcam sees someone approach, switches to the
+**live webcam feed** (a mirror) for a settable duration, then returns to
+the idle loop.
 
 Deployed on the Pi 4 (Rev 1.4, hostname `pi`, Wi-Fi) on the LAN,
 login `pi`/`pi`. Careful: there is a second, identical-looking Pi 4 at
@@ -17,13 +18,17 @@ login `pi`/`pi`. Careful: there is a second, identical-looking Pi 4 at
   output (`DRM_IOCTL_MODE_CREATE_DUMB: Cannot allocate memory`).
 - Proximity = OpenCV MOG2 background subtraction on the webcam
   (Logitech C920, `/dev/video0`, 320x240@10fps). When moving foreground
-  fills ≥ `PROXIMITY_RATIO` of the frame for `CONSEC_FRAMES` frames, the
-  trigger video plays via mpv's IPC socket (`/tmp/proximity-mpv.sock`),
-  followed by a `COOLDOWN_S` re-arm delay.
-- While the trigger video plays, presence keeps being checked (with the
-  background model frozen, so a motionless viewer stays detected): if
-  nobody ≥ `PRESENCE_RATIO` is in view for `IDLE_RETURN_S`, the idle loop
-  resumes early instead of finishing the video.
+  fills ≥ `PROXIMITY_RATIO` of the frame for `CONSEC_FRAMES` frames, mpv
+  switches to the live feed (`av://v4l2:/dev/video0`) via its IPC socket
+  (`/tmp/proximity-mpv.sock`) for `LIVE_S` seconds, then idle resumes
+  after a `COOLDOWN_S` re-arm delay.
+- The camera has a single opener: OpenCV releases it before mpv takes it,
+  so **no detection happens during the live view** (fixed duration).
+- **mpv segfault gotcha:** mpv crashes tearing down the v4l2 demuxer
+  ("Some buffers are still owned by the caller on close"), with raw and
+  MJPEG capture alike. Never swap away from the live stream — the player
+  quits and respawns mpv to return to idle (~1 s of black), and also
+  respawns it if it ever dies on its own.
 - The player never dies to a black screen: missing webcam → keeps looping
   idle and retries every 5 s; unexpected end-of-file → reloads idle;
   mpv exit → systemd restarts everything.
@@ -35,8 +40,9 @@ Two files at the root of the stick (FAT/exFAT/NTFS), any of
 
 ```
 idle.mp4       loops forever
-trigger.mp4    plays once on proximity
 ```
+
+(`trigger.mp4` is no longer used — proximity now shows the live webcam.)
 
 At startup the player copies them to `~/proximity-player/cache/` on the SD
 card and plays from there (the stick is slow — ~15 s to open a file while
@@ -78,9 +84,8 @@ Constants at the top of `player.py` (or env vars on the service):
 |---|---|---|
 | `PROXIMITY_RATIO` | 0.15 | Fraction of frame that must move. Higher = must be closer. |
 | `CONSEC_FRAMES` | 3 | Debounce frames above threshold. |
-| `COOLDOWN_S` | 5 | Re-arm delay after the trigger video ends. |
-| `PRESENCE_RATIO` | 0.05 | Below this, nobody counts as "in view" during the trigger video. |
-| `IDLE_RETURN_S` | 5 | Empty-frame seconds before cutting the trigger video back to idle. |
+| `COOLDOWN_S` | 5 | Re-arm delay after the live view ends. |
+| `LIVE_S` | 15 | How long the live mirror stays on screen. |
 | `CAM_INDEX` | 0 | Webcam device number. |
 
 Watch it live (each trigger logs the ratio it saw):
@@ -93,7 +98,7 @@ ssh pi@<pi-ip> journalctl -u proximity-player -f
 
 `player.py` serves a touch-friendly control panel on **http://<pi-ip>:8080/**
 (phone/tablet/laptop): live camera-ratio bar with threshold marker, sliders
-for the five tunables above, and a test-trigger button. Changes apply live
+for the tunables above, and a test-trigger button. Changes apply live
 and persist to `settings.json` (which wins over env-var defaults).
 API: `GET/POST /api/settings`, `GET /api/status`, `POST /api/test-trigger`.
 
