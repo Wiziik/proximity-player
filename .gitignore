@@ -1,0 +1,7 @@
+videos/
+cache/
+*.mp4
+*.mov
+.DS_Store
+__pycache__/
+images/
